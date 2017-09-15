@@ -17,18 +17,18 @@ namespace Breeze.TumbleBit.Client.Services
 {
     public class FullNodeBlockExplorerService : IBlockExplorerService
     {
-        FullNodeWalletCache _Cache;
-        private TumblingState tumblingState;
+        private FullNodeWalletCache Cache { get; }
+        private TumblingState TumblingState { get; }
 
         public FullNodeBlockExplorerService(FullNodeWalletCache cache, TumblingState tumblingState)
         {
-            _Cache = cache ?? throw new ArgumentNullException(nameof(cache));
-            this.tumblingState = tumblingState ?? throw new ArgumentNullException(nameof(tumblingState));
+            Cache = cache ?? throw new ArgumentNullException(nameof(cache));
+            TumblingState = tumblingState ?? throw new ArgumentNullException(nameof(tumblingState));
         }
 
         public int GetCurrentHeight()
         {
-            return _Cache.BlockCount;
+            return TumblingState.Chain.Height;
         }
 
         public uint256 WaitBlock(uint256 currentBlock, CancellationToken cancellation = default(CancellationToken))
@@ -36,11 +36,10 @@ namespace Breeze.TumbleBit.Client.Services
             while (true)
             {
                 cancellation.ThrowIfCancellationRequested();
-                var h = this.tumblingState.Chain.Tip.Header.GetHash();
+                var h = this.TumblingState.Chain.Tip.Header.GetHash();
 
                 if (h != currentBlock)
                 {
-                    _Cache.Refresh(h);
                     return h;
                 }
                 cancellation.WaitHandle.WaitOne(5000);
@@ -49,146 +48,25 @@ namespace Breeze.TumbleBit.Client.Services
 
         public async Task<ICollection<TransactionInformation>> GetTransactionsAsync(Script scriptPubKey, bool withProof)
         {
-            if (scriptPubKey == null)
-                throw new ArgumentNullException(nameof(scriptPubKey));
-
-
-            var results = _Cache
-                                        .GetEntriesFromScript(scriptPubKey)
-                                        .Select(entry => new TransactionInformation()
-                                        {
-                                            Confirmations = entry.Confirmations,
-                                            Transaction = entry.Transaction
-                                        }).ToList();
+            var foundTransactions = new HashSet<TransactionInformation>();
+            foreach(var transaction in await Cache.FindAllTransactionsAsync().ConfigureAwait(false))
+            {
+                foreach(var output in transaction.Transaction.Outputs)
+                {
+                    if(output.ScriptPubKey.Hash == scriptPubKey.Hash)
+                    {
+                        foundTransactions.Add(transaction);
+                    }
+                }
+            }
 
             if (withProof)
             {
-                foreach (var tx in results.ToList())
-                {
-                    bool found = false;
-                    var completion = new TaskCompletionSource<MerkleBlock>();
-                    bool isRequester = true;
-                    var txid = tx.Transaction.GetHash();
-                    _GettingProof.AddOrUpdate(txid, completion, (k, o) =>
-                    {
-                        isRequester = false;
-                        completion = o;
-                        return o;
-                    });
-                    if (isRequester)
-                    {
-                        try
-                        {
-                            MerkleBlock proof = null;
-
-                            foreach (var account in this.tumblingState.OriginWallet.GetAccountsByCoinType(this.tumblingState.CoinType))
-                            {
-                                var txData = account.GetTransactionsById(tx.Transaction.GetHash());
-
-                                if (txData != null)
-                                {
-                                    // TODO: Is it possible for GetTransactionsById to return multiple results?
-                                    var trx = txData.First<Stratis.Bitcoin.Features.Wallet.TransactionData>();
-
-                                    Console.WriteLine("Transaction " + trx.Id + " confirmation status: " + trx.IsConfirmed());
-                                    Console.WriteLine("Transaction " + trx.Id + " block hash: " + trx.BlockHash);
-
-                                    // Transaction is not confirmed yet - do not yet have a Merkle proof for it as there is no block
-                                    if (trx.BlockHash == null)
-                                    {
-                                        completion.TrySetResult(null);
-                                        break;
-                                    }
-
-                                    found = true;
-
-                                    try
-                                    {
-                                        proof = new MerkleBlock()
-                                        {
-                                            Header = this.tumblingState.Chain.GetBlock(trx.BlockHash).Header,
-                                            PartialMerkleTree = trx.MerkleProof
-                                        };
-                                    }
-                                    catch (Exception e)
-                                    {
-                                        Console.WriteLine("Could not create Merkle block for transaction " + tx.Transaction.GetHash() + " in block " + trx.BlockHash);
-                                    }
-
-                                    tx.MerkleProof = proof;
-                                    completion.TrySetResult(proof);
-
-                                    break;
-                                }
-                            }
-
-                            // The transaction should not be in both wallets normally
-                            if (!found)
-                            {
-                                foreach (WatchedAddress addr in this.tumblingState.WatchOnlyWalletManager.GetWatchOnlyWallet().WatchedAddresses.Values)
-                                {
-                                    addr.Transactions.TryGetValue(tx.Transaction.GetHash().ToString(), out Stratis.Bitcoin.Features.WatchOnlyWallet.TransactionData woTx);
-
-                                    if (woTx != null)
-                                    {
-                                        Console.WriteLine("Watch-only transaction " + woTx.Id + " block hash: " + woTx.BlockHash);
-
-                                        if (woTx.BlockHash == null)
-                                        {
-                                            Console.WriteLine("Watch-only transaction is not confirmed yet - do not yet have a Merkle proof for it as there is no block");
-                                            completion.TrySetResult(null);
-                                            break;
-                                        }
-
-                                        if (woTx.MerkleProof == null)
-                                        {
-                                            Console.WriteLine("Watch-only transaction has no Merkle proof recorded");
-                                            completion.TrySetResult(null);
-                                            break;
-                                        }
-
-                                        found = true;
-
-                                        try
-                                        {
-                                            proof = new MerkleBlock()
-                                            {
-                                                Header = this.tumblingState.Chain.GetBlock(woTx.BlockHash).Header,
-                                                PartialMerkleTree = woTx.MerkleProof
-                                            };
-                                        }
-                                        catch (Exception e)
-                                        {
-                                            Console.WriteLine("Could not create Merkle block for transaction " + tx.Transaction.GetHash() + " in block " + woTx.BlockHash);
-                                        }
-
-                                        tx.MerkleProof = proof;
-                                        completion.TrySetResult(proof);
-
-                                        break;
-                                    }
-                                }
-                            }
-
-                            if (!found)
-                            {
-                                completion.TrySetResult(null);
-                                continue;
-                            }
-                        }
-                        catch (Exception ex) { completion.TrySetException(ex); }
-                        finally { _GettingProof.TryRemove(txid, out completion); }
-                    }
-
-                    var merkleBlock = await completion.Task.ConfigureAwait(false);
-                    if (merkleBlock == null)
-                        results.Remove(tx);
-                }
+                foundTransactions.RemoveWhere(x => x.Confirmations == 0 || x.MerkleProof == null);
             }
-            return results;
-        }
 
-        ConcurrentDictionary<uint256, TaskCompletionSource<MerkleBlock>> _GettingProof = new ConcurrentDictionary<uint256, TaskCompletionSource<MerkleBlock>>();
+            return foundTransactions.OrderBy(x => x.Confirmations).ToArray();
+        }
 
         private List<TransactionInformation> QueryWithListReceivedByAddress(bool withProof, BitcoinAddress address)
         {
@@ -201,7 +79,7 @@ namespace Breeze.TumbleBit.Client.Services
             List<uint256> txIdList = new List<uint256>();
 
             // First examine watch-only wallet
-            var watchOnlyWallet = this.tumblingState.WatchOnlyWalletManager.GetWatchOnlyWallet();
+            var watchOnlyWallet = this.TumblingState.WatchOnlyWalletManager.GetWatchOnlyWallet();
 
             // TODO: This seems highly inefficient, maybe we need a cache or quicker lookup mechanism
             foreach (var watchedAddressKeyValue in watchOnlyWallet.WatchedAddresses)
@@ -217,7 +95,7 @@ namespace Breeze.TumbleBit.Client.Services
                     foreach (var vout in watchOnlyTx.Value.Transaction.Outputs)
                     {
                         // Look at each of the addresses contained in the scriptPubKey to see if they match
-                        if (address == vout.ScriptPubKey.GetDestinationAddress(this.tumblingState.TumblerNetwork))
+                        if (address == vout.ScriptPubKey.GetDestinationAddress(this.TumblingState.TumblerNetwork))
                         {
                              txIdList.Add(watchOnlyTx.Value.Transaction.GetHash());
                         }
@@ -227,9 +105,9 @@ namespace Breeze.TumbleBit.Client.Services
 
             // Search transactions in regular wallet for matching address criteria
 
-            foreach (var walletTx in this.tumblingState.OriginWallet.GetAllTransactionsByCoinType(this.tumblingState.CoinType))
+            foreach (var walletTx in this.TumblingState.OriginWallet.GetAllTransactionsByCoinType(this.TumblingState.CoinType))
             {
-                if (address == walletTx.ScriptPubKey.GetDestinationAddress(this.tumblingState.TumblerNetwork))
+                if (address == walletTx.ScriptPubKey.GetDestinationAddress(this.TumblingState.TumblerNetwork))
                 {
                     txIdList.Add(walletTx.Id);
                 }
@@ -265,7 +143,7 @@ namespace Breeze.TumbleBit.Client.Services
                 if (!resultsSet.Contains(obj.TransactionId))
                 {
                     var confirmations = obj.Confirmations;
-                    var tx = _Cache.GetTransaction(obj.TransactionId);
+                    var tx = Cache.FindAllTransactionsAsync().Result.Where(x=>x.Transaction.GetHash() == obj.TransactionId)?.FirstOrDefault()?.Transaction;
 
                     if (tx == null || (!includeUnconf && confirmations == 0))
                         continue;
@@ -290,7 +168,7 @@ namespace Breeze.TumbleBit.Client.Services
         {
             try
             {
-                foreach (WatchedAddress addr in this.tumblingState.WatchOnlyWalletManager.GetWatchOnlyWallet().WatchedAddresses.Values)
+                foreach (WatchedAddress addr in this.TumblingState.WatchOnlyWalletManager.GetWatchOnlyWallet().WatchedAddresses.Values)
                 {
                     addr.Transactions.TryGetValue(txId.ToString(), out Stratis.Bitcoin.Features.WatchOnlyWallet.TransactionData trans);
 
@@ -305,7 +183,7 @@ namespace Breeze.TumbleBit.Client.Services
                 }
                 
                 // Transaction was not in watch-only wallet
-                foreach (var walletTx in this.tumblingState.OriginWallet.GetAllTransactionsByCoinType(this.tumblingState.CoinType))
+                foreach (var walletTx in this.TumblingState.OriginWallet.GetAllTransactionsByCoinType(this.TumblingState.CoinType))
                 {
                     if (walletTx.Id != txId)
                         continue;
@@ -327,7 +205,7 @@ namespace Breeze.TumbleBit.Client.Services
 
         public async Task TrackAsync(Script scriptPubkey)
         {
-            await Task.Run(() => this.tumblingState.WatchOnlyWalletManager.WatchAddress(scriptPubkey.GetDestinationAddress(this.tumblingState.TumblerNetwork).ToString())).ConfigureAwait(false);
+            await Task.Run(() => this.TumblingState.WatchOnlyWalletManager.WatchAddress(scriptPubkey.GetDestinationAddress(this.TumblingState.TumblerNetwork).ToString())).ConfigureAwait(false);
         }
 
         public int GetBlockConfirmations(uint256 blockId)
@@ -335,12 +213,12 @@ namespace Breeze.TumbleBit.Client.Services
             if (blockId == null)
                 return 0;
 
-            ChainedBlock block = this.tumblingState.Chain.GetBlock(blockId);
+            ChainedBlock block = this.TumblingState.Chain.GetBlock(blockId);
 
             if (block == null)
                 return 0;
 
-            int tipHeight = this.tumblingState.Chain.Tip.Height;
+            int tipHeight = this.TumblingState.Chain.Tip.Height;
             int confirmations = tipHeight - block.Height + 1;
             int confCount = Math.Max(0, confirmations);
 
@@ -351,7 +229,7 @@ namespace Breeze.TumbleBit.Client.Services
         {
             bool success = false;
 
-            ChainedBlock chainBlock = this.tumblingState.Chain.GetBlock(merkleProof.Header.GetHash());
+            ChainedBlock chainBlock = this.TumblingState.Chain.GetBlock(merkleProof.Header.GetHash());
 
             if (chainBlock == null)
                 return false;
@@ -359,17 +237,12 @@ namespace Breeze.TumbleBit.Client.Services
             await Task.Run(() =>
             {
                 // TODO: We cannot obtain the complete block to pass to ProcessTransaction. Is this going to be a problem?
-                this.tumblingState.WalletManager.ProcessTransaction(transaction, chainBlock.Height, null);
+                this.TumblingState.WalletManager.ProcessTransaction(transaction, chainBlock.Height, null);
 
                 // TODO: Track via Watch Only wallet instead?
 
                 // We don't really have the same error conditions available that the original code used to determine success
                 success = true;
-
-                if (success)
-                {
-                    _Cache.ImportTransaction(transaction, GetBlockConfirmations(merkleProof.Header.GetHash()));
-                }
             }).ConfigureAwait(false);
 
             return success;
