@@ -35,7 +35,7 @@ dotnet build
 
 # Run a daemon Bitcoin SPV node on testnet with tumblebit
 cd src/Breeze.Daemon
-dotnet run light -testnet -tumblebit -ppuri=ctb://pmkdcyilefpi2aal.onion?h=aa4e984c5655a677716539acc8cbc0ce29331429
+dotnet run light --testnet -tumblebit -ppuri=ctb://pmkdcyilefpi2aal.onion?h=aa4e984c5655a677716539acc8cbc0ce29331429
 ```
 
 To build the client:
